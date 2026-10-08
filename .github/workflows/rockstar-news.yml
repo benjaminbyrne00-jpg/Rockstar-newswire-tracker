@@ -1,0 +1,102 @@
+
+name: Rockstar News to Discord
+
+on:
+  schedule:
+    - cron: '23 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rockstar-newswire
+  cancel-in-progress: false
+
+jobs:
+  check-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Get tracker files
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci --omit=dev
+
+      - name: Check Rockstar news
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const yaml = require('js-yaml');
+          const { NewswirePoller } = require('./src/poller');
+          const { DiscordNotifier } = require('./src/discordNotifier');
+          const { genres } = require('./src/newswireApi');
+          const store = require('./src/articleStore');
+
+          (async () => {
+            if (!process.env.DISCORD_WEBHOOK_URL) {
+              throw new Error('Discord webhook secret is missing');
+            }
+
+            const config = yaml.load(
+              fs.readFileSync('config/config.yaml', 'utf8')
+            );
+
+            for (const genre of new Set(config.genres || ['latest'])) {
+              if (!(genre in genres)) {
+                throw new Error(`Unknown news category: ${genre}`);
+              }
+
+              console.log(`Checking ${genre}`);
+
+              const poller = new NewswirePoller({
+                genre,
+                tagId: genres[genre],
+                store,
+                notifier: new DiscordNotifier({
+                  webhookUrl: process.env.DISCORD_WEBHOOK_URL,
+                  profileName: config.discordProfileName,
+                  avatarUrl: config.discordAvatarUrl,
+                  dateFormat: config.dateFormat || 'DD/MM/YYYY'
+                }),
+                options: {
+                  autoStart: false,
+                  enableRSS: false,
+                  checkLimit: config.checkLimit || 5,
+                  refreshInterval: 7200000
+                }
+              });
+
+              await poller.start();
+            }
+
+            process.exit(0);
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Save posted article history
+        if: always()
+        run: |
+          if [ -f config/newswire_articles.json ]; then
+            git add -f config/newswire_articles.json
+            if ! git diff --cached --quiet; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git commit -m "Save posted news history"
+              git push origin HEAD:master
+            fi
+          fi
